@@ -7,6 +7,9 @@ import express from 'express';
 import cors from 'cors';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { randomUUID } from 'node:crypto';
 import { 
   CallToolRequestSchema,
   ErrorCode,
@@ -62,6 +65,7 @@ class GHLMCPHttpServer {
   private surveyTools: SurveyTools;
   private storeTools: StoreTools;
   private productsTools: ProductsTools;
+  private streamableTransports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
   private port: number;
 
   constructor() {
@@ -166,8 +170,12 @@ class GHLMCPHttpServer {
    * Setup MCP request handlers
    */
   private setupMCPHandlers(): void {
+    this.registerMcpHandlers(this.server);
+  }
+
+  private registerMcpHandlers(server: Server): void {
     // Handle list tools requests
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
       console.log('[GHL MCP HTTP] Listing available tools...');
       
       try {
@@ -224,7 +232,7 @@ class GHLMCPHttpServer {
     });
 
     // Handle tool execution requests
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       
       console.log(`[GHL MCP HTTP] Executing tool: ${name}`);
@@ -386,6 +394,62 @@ class GHLMCPHttpServer {
     this.app.get('/sse', handleSSE);
     this.app.post('/sse', handleSSE);
 
+    // Streamable HTTP endpoint for modern MCP clients (Cowork, Claude.ai, etc.)
+    const handleStreamableHttpInit = async (req: express.Request, res: express.Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      let transport: StreamableHTTPServerTransport;
+
+      if (sessionId && this.streamableTransports[sessionId]) {
+        transport = this.streamableTransports[sessionId];
+      } else if (!sessionId && isInitializeRequest(req.body)) {
+        const newServer = new Server(
+          { name: 'ghl-mcp-server', version: '1.0.0' },
+          { capabilities: { tools: {} } }
+        );
+        this.registerMcpHandlers(newServer);
+
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid: string) => {
+            this.streamableTransports[sid] = transport;
+            console.log(`[GHL MCP HTTP] Streamable HTTP session initialized: ${sid}`);
+          }
+        });
+
+        transport.onclose = () => {
+          if (transport.sessionId) {
+            delete this.streamableTransports[transport.sessionId];
+            console.log(`[GHL MCP HTTP] Streamable HTTP session closed: ${transport.sessionId}`);
+          }
+        };
+
+        await newServer.connect(transport);
+      } else {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: null,
+        });
+        return;
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    };
+
+    const handleStreamableHttpSession = async (req: express.Request, res: express.Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !this.streamableTransports[sessionId]) {
+        res.status(400).send('Invalid or missing session ID');
+        return;
+      }
+      const transport = this.streamableTransports[sessionId];
+      await transport.handleRequest(req, res);
+    };
+
+    this.app.post('/mcp', handleStreamableHttpInit);
+    this.app.get('/mcp', handleStreamableHttpSession);
+    this.app.delete('/mcp', handleStreamableHttpSession);
+
     // Root endpoint with server info
     this.app.get('/', (req, res) => {
       res.json({
@@ -396,7 +460,8 @@ class GHLMCPHttpServer {
           health: '/health',
           capabilities: '/capabilities',
           tools: '/tools',
-          sse: '/sse'
+          sse: '/sse',
+          mcp: '/mcp'
         },
         tools: this.getToolsCount(),
         documentation: 'https://github.com/your-repo/ghl-mcp-server'
